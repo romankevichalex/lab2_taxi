@@ -1,0 +1,281 @@
+import json
+from decimal import Decimal, ROUND_HALF_UP
+
+from kafka import KafkaConsumer, KafkaProducer, TopicPartition
+
+
+BOOTSTRAP_SERVERS = "localhost:9092"
+
+LOAD_WEIGHT = 0.5
+QUEUE_WEIGHT = 1.0
+MAX_MULTIPLIER = 3.0
+
+BASE_FARE = Decimal("3.00")
+PRICE_PER_KM = Decimal("0.80")
+PRICE_PER_MINUTE = Decimal("0.15")  
+MIN_FARE = Decimal("5.00")
+
+ALERT_THRESHOLD = 1.5
+
+
+def calculate_multiplier(total_drivers, free_drivers, waiting_orders):
+    if total_drivers == 0:
+        return None
+
+    utilization = (total_drivers - free_drivers) / total_drivers
+
+    queue_ratio = waiting_orders / total_drivers
+
+    multiplier = 1 + LOAD_WEIGHT * utilization + QUEUE_WEIGHT * queue_ratio
+
+    return min(MAX_MULTIPLIER, multiplier)
+
+
+def calculate_price(distance_km, duration_min, multiplier):
+    if multiplier is None:
+        return None
+
+    base_price = (
+        BASE_FARE
+        + Decimal(str(distance_km)) * PRICE_PER_KM
+        + Decimal(str(duration_min)) * PRICE_PER_MINUTE
+    )
+
+    price = max(MIN_FARE, base_price * Decimal(str(multiplier)))
+
+    return float(price.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+
+
+def get_status(total_drivers, free_drivers, waiting_orders, multiplier):
+    if total_drivers == 0:
+        return "NO_DATA"
+
+    if free_drivers == 0 and waiting_orders > 0:
+        return "NO_DRIVERS"
+
+    if multiplier >= ALERT_THRESHOLD:
+        return "HIGH_DEMAND"
+
+    return "NORMAL"
+
+
+def publish(producer, topic, result):
+    producer.send(topic, value=result).get(timeout=30)
+
+    print(f'{topic}: {json.dumps(result, ensure_ascii=False)}', flush=True)
+
+
+def apply_event(event, all_drivers, free_drivers, waiting_orders, active_trips):
+    event_type = event["event_type"]
+
+    if event_type == "driver_available":
+        driver_id = event["driver_id"]
+
+        if driver_id in all_drivers:
+            raise ValueError(
+                f"Повторная регистрация водителя: {driver_id}"
+            )
+
+        all_drivers.add(driver_id)
+        free_drivers.add(driver_id)
+
+    elif event_type == "order_created":
+        order_id = event["order_id"]
+        distance = event["distance_km"]
+        duration = event["duration_min"]
+
+        if distance <= 0 or duration <= 0:
+            raise ValueError(
+                "Расстояние и длительность должны быть > 0"
+            )
+
+        if (
+            order_id in waiting_orders
+            or order_id in active_trips.values()
+        ):
+            raise ValueError(
+                f"Заказ уже существует: {order_id}"
+            )
+
+        waiting_orders.add(order_id)
+
+    elif event_type == "order_assigned":
+        order_id = event["order_id"]
+        driver_id = event["driver_id"]
+
+        if order_id not in waiting_orders:
+            raise ValueError(
+                f"Заказ не ожидает назначения: {order_id}"
+            )
+
+        if driver_id not in free_drivers:
+            raise ValueError(
+                f"Водитель не свободен: {driver_id}"
+            )
+
+        waiting_orders.remove(order_id)
+        free_drivers.remove(driver_id)
+        active_trips[driver_id] = order_id
+
+    elif event_type == "trip_completed":
+        driver_id = event["driver_id"]
+        order_id = event["order_id"]
+
+        if active_trips.get(driver_id) != order_id:
+            raise ValueError(
+                "Завершение не соответствует активной поездке"
+            )
+
+        del active_trips[driver_id]
+        free_drivers.add(driver_id)
+
+    elif event_type == "order_cancelled":
+        order_id = event["order_id"]
+
+        if order_id not in waiting_orders:
+            raise ValueError(
+                f"Заказ не находится в очереди: {order_id}"
+            )
+
+        waiting_orders.remove(order_id)
+
+    else:
+        raise ValueError(
+            f"Неизвестный тип события: {event_type}"
+        )
+
+
+def main():
+    consumer = KafkaConsumer(
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        group_id=None,
+        enable_auto_commit=False,
+    )
+
+    partition = TopicPartition("taxi.events", 0)
+    consumer.assign([partition])
+    consumer.seek_to_beginning(partition)
+
+    producer = KafkaProducer(
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        value_serializer=lambda value: json.dumps(
+            value, ensure_ascii=False
+        ).encode("utf-8"),
+        acks="all",
+        max_in_flight_requests_per_connection=1,
+    )
+
+    all_drivers = set()
+    free_drivers = set()
+    waiting_orders = set()
+
+    # driver_id → order_id
+    active_trips = {}
+
+    previous_status = "NO_DATA"
+
+    print('Обработчик запущен. Входной топик читается с начала.', flush=True)
+
+    try:
+        for message in consumer:
+
+            try:
+                event = json.loads(message.value.decode("utf-8"))
+
+                if not isinstance(event, dict):
+                    raise ValueError("Событие должно быть объектом")
+
+                event_type = event["event_type"]
+                source_event_id = event["event_id"]
+                simulation_time = event["simulation_time_min"]
+
+                apply_event(
+                    event, all_drivers, free_drivers, waiting_orders, active_trips
+                )
+
+            except (ValueError, KeyError, TypeError, UnicodeError) as error:
+                print(f'Пропуск сообщения offset={message.offset}: {error}', flush=True)
+                continue
+
+            total_count = len(all_drivers)
+            free_count = len(free_drivers)
+            waiting_count = len(waiting_orders)
+
+            multiplier = calculate_multiplier(total_count, free_count, waiting_count)
+
+            utilization = (
+                (total_count - free_count) / total_count
+                if total_count > 0
+                else None
+            )
+
+            status = get_status(total_count, free_count, waiting_count, multiplier)
+
+            result = {
+                "source_event_id": source_event_id,
+                "simulation_time_min": simulation_time,
+                "total_drivers": total_count,
+                "free_drivers": free_count,
+                "busy_drivers": len(active_trips),
+                "waiting_orders": waiting_count,
+                "utilization": (
+                    round(utilization, 4)
+                    if utilization is not None
+                    else None
+                ),
+                "multiplier": (
+                    round(multiplier, 4)
+                    if multiplier is not None
+                    else None
+                ),
+                "status": status,
+                "service_available": free_count > 0,
+            }
+
+            publish(producer, "taxi.coefficients", result)
+
+            if (
+                status != previous_status
+                and status in {"HIGH_DEMAND", "NO_DRIVERS"}
+            ):
+                publish(
+                    producer,
+                    "taxi.alerts",
+                    {
+                        **result,
+                        "previous_status": previous_status,
+                    },
+                )
+
+            previous_status = status
+
+            if event_type == "order_created":
+                price = calculate_price(
+                    event["distance_km"],
+                    event["duration_min"],
+                    multiplier,
+                )
+
+                publish(
+                    producer,
+                    "taxi.prices",
+                    {
+                        **result,
+                        "order_id": event["order_id"],
+                        "distance_km": event["distance_km"],
+                        "duration_min": event["duration_min"],
+                        "estimated_price": price,
+                        "currency": "BYN",
+                    },
+                )
+
+    except KeyboardInterrupt:
+        print("\nОбработчик остановлен.", flush=True)
+
+    finally:
+        consumer.close()
+        producer.close()
+
+
+if __name__ == "__main__":
+    main()
