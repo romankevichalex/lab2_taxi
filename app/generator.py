@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from kafka import KafkaProducer
+from app.kafka_utils import create_producer, send_with_retry
 
 
 DRIVERS_COUNT = 50
@@ -19,6 +19,10 @@ MIN_PATIENCE_MIN = 3
 MAX_PATIENCE_MIN = 12
 
 CONFIG_PATH = (Path(__file__).resolve().parent.parent / "simulation.json")
+
+# Идентификатор запуска генератора. Позволяет обработчику и дашборду
+# отличать события разных симуляций в одном топике.
+RUN_ID = uuid4().hex
 
 
 def read_activity(previous):
@@ -51,13 +55,14 @@ def next_arrival(now, activity):
 def send_event(producer, now, event_type, **fields):
     event = {
         "event_id": uuid4().hex,
+        "run_id": RUN_ID,
         "event_type": event_type,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "simulation_time_min": round(now, 3),
         **fields,
     }
 
-    producer.send('taxi.events', value=event).get(timeout=30)
+    send_with_retry(producer, 'taxi.events', event)
 
     print(json.dumps(event, ensure_ascii=False), flush=True)
 
@@ -169,14 +174,7 @@ def assign_orders(producer, drivers, waiting_orders, now):
 
 
 def main():
-    producer = KafkaProducer(
-        bootstrap_servers="localhost:9092",
-        value_serializer=lambda event: json.dumps(
-            event, ensure_ascii=False
-        ).encode("utf-8"),
-        acks="all",
-        max_in_flight_requests_per_connection=1,
-    )
+    producer = create_producer()
 
     # None означает, что водитель свободен.
     drivers = {f'driver-{number:03d}': None for number in range(1, DRIVERS_COUNT + 1)}
@@ -184,6 +182,9 @@ def main():
     waiting_orders = deque()
 
     try:
+        # Начало новой симуляции: потребители сбрасывают состояние.
+        send_event(producer, 0.0, 'simulation_started')
+
         for driver_id in drivers:
             send_event(producer, 0.0, 'driver_available', driver_id=driver_id)
 
@@ -194,7 +195,7 @@ def main():
         next_config_check = started_at
 
         print(
-            f"\nГенератор запущен. Активность: {activity}. "
+            f"\nГенератор запущен (run_id={RUN_ID}). Активность: {activity}. "
             "Остановка: Ctrl+C.\n",
             flush=True,
         )

@@ -1,10 +1,16 @@
 import json
+import time
 from decimal import Decimal, ROUND_HALF_UP
 
-from kafka import KafkaConsumer, KafkaProducer, TopicPartition
+from kafka import KafkaConsumer, TopicPartition
+
+from app.kafka_utils import BOOTSTRAP_SERVERS, create_producer, send_with_retry
 
 
-BOOTSTRAP_SERVERS = "localhost:9092"
+EVENTS_TOPIC = "taxi.events"
+COEFFICIENTS_TOPIC = "taxi.coefficients"
+PRICES_TOPIC = "taxi.prices"
+ALERTS_TOPIC = "taxi.alerts"
 
 LOAD_WEIGHT = 0.5
 QUEUE_WEIGHT = 1.0
@@ -60,13 +66,17 @@ def get_status(total_drivers, free_drivers, waiting_orders, multiplier):
 
 
 def publish(producer, topic, result):
-    producer.send(topic, value=result).get(timeout=30)
+    send_with_retry(producer, topic, result)
 
     print(f'{topic}: {json.dumps(result, ensure_ascii=False)}', flush=True)
 
 
 def apply_event(event, all_drivers, free_drivers, waiting_orders, active_trips):
     event_type = event["event_type"]
+
+    if event_type == "simulation_started":
+        # Состояние уже сброшено при смене run_id в main().
+        return
 
     if event_type == "driver_available":
         driver_id = event["driver_id"]
@@ -145,6 +155,82 @@ def apply_event(event, all_drivers, free_drivers, waiting_orders, active_trips):
         )
 
 
+def new_state():
+    return {
+        "all_drivers": set(),
+        "free_drivers": set(),
+        "waiting_orders": set(),
+        # driver_id → order_id
+        "active_trips": {},
+        "previous_status": "NO_DATA",
+    }
+
+
+def read_last_published_offset(events_end_offset):
+    """Offset последнего входного события, по которому уже есть результат.
+
+    Обработчик при старте заново читает taxi.events, чтобы восстановить
+    состояние, но публикует результаты только для событий после этого
+    offset. Так перезапуск не дублирует выходные топики.
+    """
+    consumer = KafkaConsumer(
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        group_id=None,
+        enable_auto_commit=False,
+    )
+
+    try:
+        partition = TopicPartition(COEFFICIENTS_TOPIC, 0)
+        consumer.assign([partition])
+
+        end = consumer.end_offsets([partition])[partition]
+
+        if end == 0:
+            return -1
+
+        consumer.seek(partition, end - 1)
+
+        deadline = time.monotonic() + 10
+
+        while time.monotonic() < deadline:
+            for messages in consumer.poll(timeout_ms=1000).values():
+                for message in messages:
+                    try:
+                        offset = json.loads(message.value)["source_offset"]
+                    except (ValueError, KeyError, TypeError):
+                        # Результат старой версии без source_offset.
+                        return -1
+
+                    # Входной топик пересоздан, а выходной нет.
+                    if offset >= events_end_offset:
+                        return -1
+
+                    return offset
+
+        raise RuntimeError(
+            f"Не удалось прочитать последнее сообщение {COEFFICIENTS_TOPIC}"
+        )
+
+    finally:
+        consumer.close()
+
+
+def check_run(event, current_run_id, finished_runs):
+    """Возвращает True, если событие начинает новую симуляцию."""
+    run_id = event.get("run_id")
+
+    if run_id is None:
+        raise ValueError("нет run_id: событие старой версии генератора")
+
+    if run_id == current_run_id:
+        return False
+
+    if run_id in finished_runs:
+        raise ValueError(f"событие завершённой симуляции {run_id}")
+
+    return True
+
+
 def main():
     consumer = KafkaConsumer(
         bootstrap_servers=BOOTSTRAP_SERVERS,
@@ -152,32 +238,41 @@ def main():
         enable_auto_commit=False,
     )
 
-    partition = TopicPartition("taxi.events", 0)
+    partition = TopicPartition(EVENTS_TOPIC, 0)
     consumer.assign([partition])
     consumer.seek_to_beginning(partition)
 
-    producer = KafkaProducer(
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        value_serializer=lambda value: json.dumps(
-            value, ensure_ascii=False
-        ).encode("utf-8"),
-        acks="all",
-        max_in_flight_requests_per_connection=1,
+    events_end_offset = consumer.end_offsets([partition])[partition]
+    last_published = read_last_published_offset(events_end_offset)
+
+    producer = create_producer()
+
+    state = new_state()
+    current_run_id = None
+    finished_runs = set()
+
+    replay_skipped = 0
+    replay_announced = last_published < 0
+
+    print(
+        "Обработчик запущен. Входной топик читается с начала; "
+        f"результаты уже опубликованы до offset {last_published}.",
+        flush=True,
     )
-
-    all_drivers = set()
-    free_drivers = set()
-    waiting_orders = set()
-
-    # driver_id → order_id
-    active_trips = {}
-
-    previous_status = "NO_DATA"
-
-    print('Обработчик запущен. Входной топик читается с начала.', flush=True)
 
     try:
         for message in consumer:
+            # События до last_published уже обработаны прежним запуском:
+            # восстанавливаем по ним состояние, но не публикуем повторно.
+            replaying = message.offset <= last_published
+
+            if not replaying and not replay_announced:
+                print(
+                    f"Состояние восстановлено по {message.offset} событиям "
+                    f"(пропущено некорректных: {replay_skipped}).",
+                    flush=True,
+                )
+                replay_announced = True
 
             try:
                 event = json.loads(message.value.decode("utf-8"))
@@ -189,17 +284,42 @@ def main():
                 source_event_id = event["event_id"]
                 simulation_time = event["simulation_time_min"]
 
+                if check_run(event, current_run_id, finished_runs):
+                    if current_run_id is not None:
+                        finished_runs.add(current_run_id)
+
+                    current_run_id = event["run_id"]
+                    state = new_state()
+
+                    if not replaying:
+                        print(
+                            f"Новая симуляция: run_id={current_run_id}",
+                            flush=True,
+                        )
+
                 apply_event(
-                    event, all_drivers, free_drivers, waiting_orders, active_trips
+                    event,
+                    state["all_drivers"],
+                    state["free_drivers"],
+                    state["waiting_orders"],
+                    state["active_trips"],
                 )
 
-            except (ValueError, KeyError, TypeError, UnicodeError) as error:
-                print(f'Пропуск сообщения offset={message.offset}: {error}', flush=True)
+            except (
+                ValueError, KeyError, TypeError, UnicodeError, AttributeError
+            ) as error:
+                if replaying:
+                    replay_skipped += 1
+                else:
+                    print(
+                        f'Пропуск сообщения offset={message.offset}: {error}',
+                        flush=True,
+                    )
                 continue
 
-            total_count = len(all_drivers)
-            free_count = len(free_drivers)
-            waiting_count = len(waiting_orders)
+            total_count = len(state["all_drivers"])
+            free_count = len(state["free_drivers"])
+            waiting_count = len(state["waiting_orders"])
 
             multiplier = calculate_multiplier(total_count, free_count, waiting_count)
 
@@ -210,13 +330,20 @@ def main():
             )
 
             status = get_status(total_count, free_count, waiting_count, multiplier)
+            previous_status = state["previous_status"]
+            state["previous_status"] = status
+
+            if replaying:
+                continue
 
             result = {
                 "source_event_id": source_event_id,
+                "source_offset": message.offset,
+                "run_id": current_run_id,
                 "simulation_time_min": simulation_time,
                 "total_drivers": total_count,
                 "free_drivers": free_count,
-                "busy_drivers": len(active_trips),
+                "busy_drivers": len(state["active_trips"]),
                 "waiting_orders": waiting_count,
                 "utilization": (
                     round(utilization, 4)
@@ -232,22 +359,18 @@ def main():
                 "service_available": free_count > 0,
             }
 
-            publish(producer, "taxi.coefficients", result)
-
             if (
                 status != previous_status
                 and status in {"HIGH_DEMAND", "NO_DRIVERS"}
             ):
                 publish(
                     producer,
-                    "taxi.alerts",
+                    ALERTS_TOPIC,
                     {
                         **result,
                         "previous_status": previous_status,
                     },
                 )
-
-            previous_status = status
 
             if event_type == "order_created":
                 price = calculate_price(
@@ -258,7 +381,7 @@ def main():
 
                 publish(
                     producer,
-                    "taxi.prices",
+                    PRICES_TOPIC,
                     {
                         **result,
                         "order_id": event["order_id"],
@@ -268,6 +391,11 @@ def main():
                         "currency": "BYN",
                     },
                 )
+
+            # Коэффициенты публикуются последними: по их source_offset
+            # следующий запуск определяет, какие события уже обработаны
+            # полностью.
+            publish(producer, COEFFICIENTS_TOPIC, result)
 
     except KeyboardInterrupt:
         print("\nОбработчик остановлен.", flush=True)

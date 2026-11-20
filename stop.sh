@@ -12,4 +12,4 @@ if [[ -f .app-pids ]]; then
     rm -f .app-pids
 fi
 
-sudo docker compose down
+docker compose down

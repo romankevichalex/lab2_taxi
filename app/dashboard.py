@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from bisect import bisect_right
 
 import pandas as pd
@@ -24,61 +26,145 @@ st.caption(
 )
 
 
-def initialize():
-    consumer = KafkaConsumer(
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        group_id=None,
-        enable_auto_commit=False,
-    )
+class Feed:
+    """Один фоновый читатель Kafka на весь сервер Streamlit.
 
-    partitions = [TopicPartition(STATE_TOPIC, 0), TopicPartition(PRICE_TOPIC, 0)]
+    Все вкладки браузера показывают одно и то же состояние, поэтому
+    отдельный потребитель на каждую сессию не нужен: он перечитывал бы
+    топики с начала при каждом обновлении страницы и никогда не закрывался.
 
-    consumer.assign(partitions)
-    consumer.seek_to_beginning(*partitions)
+    Хранятся только сообщения текущей симуляции (run_id) за последние
+    HISTORY_MINUTES + AVERAGE_WINDOW_MINUTES модельных минут.
+    """
 
-    st.session_state["consumer"] = consumer
-    st.session_state["states"] = []
-    st.session_state["prices"] = []
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._run_id = None
+        self._finished_runs = set()
+        self._states = []
+        self._prices = []
+        self._error = None
 
-    st.session_state['seen'] = {STATE_TOPIC: set(), PRICE_TOPIC: set()}
+        threading.Thread(
+            target=self._run, name="kafka-feed", daemon=True
+        ).start()
+
+    def snapshot(self):
+        with self._lock:
+            return (
+                self._run_id,
+                list(self._states),
+                list(self._prices),
+                self._error,
+            )
+
+    def _set_error(self, error):
+        with self._lock:
+            self._error = error
+
+    def _connect(self):
+        while True:
+            try:
+                consumer = KafkaConsumer(
+                    bootstrap_servers=BOOTSTRAP_SERVERS,
+                    group_id=None,
+                    enable_auto_commit=False,
+                )
+
+                partitions = [
+                    TopicPartition(STATE_TOPIC, 0),
+                    TopicPartition(PRICE_TOPIC, 0),
+                ]
+
+                consumer.assign(partitions)
+                consumer.seek_to_beginning(*partitions)
+
+                return consumer
+
+            except Exception as error:
+                self._set_error(f"Не удалось подключиться к Kafka: {error}")
+                time.sleep(5)
+
+    def _run(self):
+        consumer = self._connect()
+
+        while True:
+            try:
+                batches = consumer.poll(timeout_ms=500, max_records=1000)
+            except Exception as error:
+                self._set_error(f"Ошибка чтения данных: {error}")
+                time.sleep(5)
+                continue
+
+            with self._lock:
+                self._error = None
+
+                for partition, messages in batches.items():
+                    for message in messages:
+                        self._add(partition.topic, message)
+
+                self._trim()
+
+    def _add(self, topic, message):
+        try:
+            event = json.loads(message.value.decode("utf-8"))
+            run_id = event["run_id"]
+            event["simulation_time_min"] = float(event["simulation_time_min"])
+        except (ValueError, KeyError, TypeError, UnicodeError, AttributeError):
+            # Повреждённое сообщение или результат старой версии без run_id.
+            return
+
+        if run_id != self._run_id:
+            # Сообщения уже сменившейся симуляции не показываются.
+            if run_id in self._finished_runs:
+                return
+
+            if self._run_id is not None:
+                self._finished_runs.add(self._run_id)
+
+            self._run_id = run_id
+            self._states = []
+            self._prices = []
+
+        if topic == STATE_TOPIC:
+            self._states.append(event)
+        elif topic == PRICE_TOPIC:
+            self._prices.append(event)
+
+    def _trim(self):
+        if not self._states:
+            return
+
+        latest_time = max(
+            event["simulation_time_min"] for event in self._states
+        )
+
+        # Дополнительный запас нужен для среднего в начале графика.
+        cutoff = latest_time - HISTORY_MINUTES - AVERAGE_WINDOW_MINUTES
+
+        self._states = [
+            event for event in self._states
+            if event["simulation_time_min"] >= cutoff
+        ]
+        self._prices = [
+            event for event in self._prices
+            if event["simulation_time_min"] >= cutoff
+        ]
 
 
-def read_messages():
-    consumer = st.session_state["consumer"]
-
-    for _ in range(5):
-        batches = consumer.poll(timeout_ms=100, max_records=1000)
-
-        if not batches:
-            break
-
-        for partition, messages in batches.items():
-            topic = partition.topic
-            seen = st.session_state["seen"][topic]
-
-            for message in messages:
-                event = json.loads(message.value.decode("utf-8"))
-                event_id = event["source_event_id"]
-
-                if event_id in seen:
-                    continue
-
-                seen.add(event_id)
-
-                if topic == STATE_TOPIC:
-                    st.session_state["states"].append(event)
-
-                elif topic == PRICE_TOPIC:
-                    st.session_state["prices"].append(event)
+@st.cache_resource
+def get_feed():
+    return Feed()
 
 
-def prepare_states():
-    states = st.session_state["states"]
-
+def prepare_states(states):
     if not states:
         return pd.DataFrame()
 
-    frame = pd.DataFrame(states)
+    # Повторы возможны после повторной отправки результата обработчиком.
+    frame = pd.DataFrame(states).drop_duplicates(
+        subset="source_event_id", keep="last"
+    )
 
     frame = (
         frame.sort_values(
@@ -94,16 +180,19 @@ def prepare_states():
     return frame.reset_index(drop=True)
 
 
-def calculate_average_prices(times):
-    prices = st.session_state["prices"]
+def calculate_average_prices(prices, times):
+    unique_prices = {
+        event["source_event_id"]: event
+        for event in prices
+        if event.get("estimated_price") is not None
+    }
 
     values = sorted(
         (
             float(event["simulation_time_min"]),
             float(event["estimated_price"]),
         )
-        for event in prices
-        if event.get("estimated_price") is not None
+        for event in unique_prices.values()
     )
 
     price_times = [time for time, _ in values]
@@ -129,30 +218,14 @@ def calculate_average_prices(times):
     return averages
 
 
-def trim_history(latest_time):
-    # Дополнительный запас нужен для среднего в начале графика.
-    cutoff = latest_time - HISTORY_MINUTES - AVERAGE_WINDOW_MINUTES
-
-    for key in ("states", "prices"):
-        st.session_state[key] = [
-            event
-            for event in st.session_state[key]
-            if event["simulation_time_min"] >= cutoff
-        ]
-
-
 @st.fragment(run_every="1s")
 def dashboard():
-    try:
-        read_messages()
-    except Exception as error:
-        st.error(f"Ошибка чтения данных: {error}")
-        st.caption(
-            "Kafka "
-        )
-        return
+    run_id, states, prices, error = get_feed().snapshot()
 
-    states = prepare_states()
+    if error:
+        st.warning(f"{error}. Повторная попытка через несколько секунд.")
+
+    states = prepare_states(states)
 
     if states.empty:
         st.info('Нет данных.')
@@ -167,7 +240,7 @@ def dashboard():
     ].copy()
 
     chart["average_price"] = calculate_average_prices(
-        chart["simulation_time_min"].tolist()
+        prices, chart["simulation_time_min"].tolist()
     )
 
     last_average = chart["average_price"].iloc[-1]
@@ -198,7 +271,10 @@ def dashboard():
         else "Нет заказов",
     )
 
-    st.caption(f"Модельное время: {latest_time:.1f} мин. Статус: {latest['status']}.")
+    st.caption(
+        f"Модельное время: {latest_time:.1f} мин. "
+        f"Статус: {latest['status']}. Симуляция: {run_id[:8]}."
+    )
 
     graph = chart.rename(
         columns={
@@ -234,14 +310,5 @@ def dashboard():
         "остаётся в статистике."
     )
 
-    trim_history(latest_time)
-
-
-if "consumer" not in st.session_state:
-    try:
-        initialize()
-    except Exception as error:
-        st.error(f"Не удалось подключиться к Kafka: {error}")
-        st.stop()
 
 dashboard()
