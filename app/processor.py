@@ -1,10 +1,10 @@
 import json
 from decimal import Decimal, ROUND_HALF_UP
 
-from kafka import KafkaConsumer, KafkaProducer, TopicPartition
+from kafka import KafkaConsumer, TopicPartition
 
+from app.kafka_utils import BOOTSTRAP_SERVERS, create_producer, send_with_retry
 
-BOOTSTRAP_SERVERS = "localhost:9092"
 
 LOAD_WEIGHT = 0.5
 QUEUE_WEIGHT = 1.0
@@ -60,7 +60,7 @@ def get_status(total_drivers, free_drivers, waiting_orders, multiplier):
 
 
 def publish(producer, topic, result):
-    producer.send(topic, value=result).get(timeout=30)
+    send_with_retry(producer, topic, result)
 
     print(f'{topic}: {json.dumps(result, ensure_ascii=False)}', flush=True)
 
@@ -156,14 +156,7 @@ def main():
     consumer.assign([partition])
     consumer.seek_to_beginning(partition)
 
-    producer = KafkaProducer(
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        value_serializer=lambda value: json.dumps(
-            value, ensure_ascii=False
-        ).encode("utf-8"),
-        acks="all",
-        max_in_flight_requests_per_connection=1,
-    )
+    producer = create_producer()
 
     all_drivers = set()
     free_drivers = set()
