@@ -20,6 +20,10 @@ MAX_PATIENCE_MIN = 12
 
 CONFIG_PATH = (Path(__file__).resolve().parent.parent / "simulation.json")
 
+# Идентификатор запуска генератора. Позволяет обработчику и дашборду
+# отличать события разных симуляций в одном топике.
+RUN_ID = uuid4().hex
+
 
 def read_activity(previous):
     try:
@@ -51,6 +55,7 @@ def next_arrival(now, activity):
 def send_event(producer, now, event_type, **fields):
     event = {
         "event_id": uuid4().hex,
+        "run_id": RUN_ID,
         "event_type": event_type,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "simulation_time_min": round(now, 3),
@@ -177,6 +182,9 @@ def main():
     waiting_orders = deque()
 
     try:
+        # Начало новой симуляции: потребители сбрасывают состояние.
+        send_event(producer, 0.0, 'simulation_started')
+
         for driver_id in drivers:
             send_event(producer, 0.0, 'driver_available', driver_id=driver_id)
 
@@ -187,7 +195,7 @@ def main():
         next_config_check = started_at
 
         print(
-            f"\nГенератор запущен. Активность: {activity}. "
+            f"\nГенератор запущен (run_id={RUN_ID}). Активность: {activity}. "
             "Остановка: Ctrl+C.\n",
             flush=True,
         )
